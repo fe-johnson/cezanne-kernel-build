@@ -1,0 +1,145 @@
+name: Build cezanne kernel (SukiSU + SUSFS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: Kernel source repository (owner/name)
+        required: true
+        default: NCJFCQJ/android_kernel_xiaomi_mt6885
+      kernel_branch:
+        description: Kernel source branch
+        required: true
+        default: cgroup-v2
+      defconfig:
+        description: Defconfig
+        required: true
+        default: vendor/cezanne_user_defconfig
+      susfs_branch:
+        description: susfs4ksu branch
+        required: true
+        default: kernel-4.14
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    env:
+      KERNEL_REPO: ${{ inputs.kernel_repo }}
+      KERNEL_BRANCH: ${{ inputs.kernel_branch }}
+      DEFCONFIG: ${{ inputs.defconfig }}
+      SUSFS_BRANCH: ${{ inputs.susfs_branch }}
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git ccache bc bison flex build-essential libssl-dev libelf-dev \
+            zip curl lz4 lzop cpio device-tree-compiler python2 python3 \
+            python-is-python3 zlib1g-dev
+
+      - name: Clone kernel source
+        run: git clone --depth=1 -b "$KERNEL_BRANCH" "https://github.com/$KERNEL_REPO" kernel
+
+      - name: Download AOSP clang r487747c and GCC 4.9
+        run: |
+          base=https://android.googlesource.com/platform/prebuilts
+          mkdir clang gcc64 gcc32
+          curl -fsSL "$base/clang/host/linux-x86/+archive/refs/heads/android14-release/clang-r487747c.tar.gz" | tar -xz -C clang
+          curl -fsSL "$base/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz" | tar -xz -C gcc64
+          curl -fsSL "$base/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz" | tar -xz -C gcc32
+          clang/bin/clang --version
+
+      - name: Integrate SukiSU-Ultra
+        working-directory: kernel
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
+          echo "== SukiSU version:"; git -C KernelSU log -1 --oneline || true
+          ls -la KernelSU/kernel | head
+
+      - name: Fetch susfs4ksu and apply patches
+        working-directory: kernel
+        run: |
+          git clone --depth=1 -b "$SUSFS_BRANCH" https://gitlab.com/simonpunk/susfs4ksu.git ../susfs4ksu
+          S=../susfs4ksu/kernel_patches
+          ls "$S"
+          # copy susfs kernel-side sources
+          cp -v "$S"/fs/* fs/ || true
+          cp -v "$S"/include/linux/* include/linux/ || true
+          # copy patches
+          cp -v "$S"/50_add_susfs_in_*.patch . || true
+          cp -v "$S"/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/ 2>/dev/null || echo "no 10_enable patch (SukiSU may bundle susfs)"
+          # apply KSU-side susfs enable patch (tolerate failure; SukiSU may already have it)
+          if [ -f KernelSU/10_enable_susfs_for_ksu.patch ]; then
+            ( cd KernelSU && patch -p1 --no-backup-if-mismatch < 10_enable_susfs_for_ksu.patch ) \
+              > ../ksu_patch.log 2>&1 || echo "KSU susfs patch had rejects (see log)"
+          fi
+          # apply kernel-side susfs patch
+          patch -p1 --no-backup-if-mismatch < 50_add_susfs_in_*.patch > ../susfs_patch.log 2>&1 \
+            || echo "kernel susfs patch had rejects (see log)"
+          echo "== .rej files:"; find . -name '*.rej' | tee ../rejects.txt
+
+      - name: Enable KSU + SUSFS in defconfig
+        working-directory: kernel
+        run: |
+          DC=arch/arm64/configs/$DEFCONFIG
+          cat >> "$DC" <<'CFG'
+          CONFIG_KSU=y
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
+          CFG
+          echo "== appended config tail:"; tail -20 "$DC"
+
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: cezanne-susfs-${{ inputs.kernel_branch }}
+          max-size: 2G
+
+      - name: Build kernel
+        working-directory: kernel
+        run: |
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          export KBUILD_BUILD_USER=github KBUILD_BUILD_HOST=actions
+          args=(O=out ARCH=arm64 CC="ccache clang" LD=ld.lld
+                LLVM=1 LLVM_IAS=1 AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy
+                OBJDUMP=llvm-objdump STRIP=llvm-strip
+                CLANG_TRIPLE=aarch64-linux-gnu-
+                CROSS_COMPILE="$GITHUB_WORKSPACE/gcc64/bin/aarch64-linux-android-"
+                CROSS_COMPILE_ARM32="$GITHUB_WORKSPACE/gcc32/bin/arm-linux-androideabi-")
+          make -j"$(nproc)" "${args[@]}" "$DEFCONFIG"
+          echo "== effective susfs config:"; grep -E "CONFIG_KSU(_SUSFS)?" out/.config || true
+          set -o pipefail
+          make -j"$(nproc)" "${args[@]}" 2>&1 | tee build.log
+          ls -la out/arch/arm64/boot/
+
+      - name: Collect output
+        if: always()
+        working-directory: kernel
+        run: |
+          D="$GITHUB_WORKSPACE/artifact"; mkdir -p "$D"
+          cp -v out/arch/arm64/boot/Image* "$D/" 2>/dev/null || true
+          cp -v out/.config "$D/kernel.config" 2>/dev/null || true
+          tail -n 400 build.log > "$D/build-tail.log" 2>/dev/null || true
+          cp -v ../susfs_patch.log ../ksu_patch.log ../rejects.txt "$D/" 2>/dev/null || true
+          find . -name '*.rej' -exec cp --parents -v {} "$D/" \; 2>/dev/null || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cezanne-susfs-${{ github.run_number }}
+          path: artifact/
