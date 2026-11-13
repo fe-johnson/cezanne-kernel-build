@@ -1,4 +1,4 @@
-name: Build cezanne kernel (SukiSU + SUSFS)
+name: Build cezanne kernel (KernelSU-Next + SUSFS)
 
 on:
   workflow_dispatch:
@@ -15,6 +15,10 @@ on:
         description: Defconfig
         required: true
         default: vendor/cezanne_user_defconfig
+      ksunext_ref:
+        description: KernelSU-Next ref (branch/tag)
+        required: true
+        default: next
       susfs_branch:
         description: susfs4ksu branch
         required: true
@@ -27,6 +31,7 @@ jobs:
       KERNEL_REPO: ${{ inputs.kernel_repo }}
       KERNEL_BRANCH: ${{ inputs.kernel_branch }}
       DEFCONFIG: ${{ inputs.defconfig }}
+      KSUNEXT_REF: ${{ inputs.ksunext_ref }}
       SUSFS_BRANCH: ${{ inputs.susfs_branch }}
       CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
       CCACHE_NOHASHDIR: "true"
@@ -49,64 +54,76 @@ jobs:
           curl -fsSL "$base/clang/host/linux-x86/+archive/refs/heads/android14-release/clang-r487747c.tar.gz" | tar -xz -C clang
           curl -fsSL "$base/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz" | tar -xz -C gcc64
           curl -fsSL "$base/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz" | tar -xz -C gcc32
-          clang/bin/clang --version
 
-      - name: Integrate SukiSU-Ultra
+      - name: Integrate KernelSU-Next
         working-directory: kernel
         run: |
-          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
-          echo "== SukiSU version:"; git -C KernelSU log -1 --oneline || true
-          ls -la KernelSU/kernel | head
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/$KSUNEXT_REF/kernel/setup.sh" | bash -s "$KSUNEXT_REF"
+          echo "== KSU-Next version:"; git -C KernelSU-Next log -1 --oneline 2>/dev/null || git -C KernelSU log -1 --oneline 2>/dev/null || true
+          ls drivers/kernelsu >/dev/null 2>&1 && echo "driver symlink OK"
 
-      - name: Fetch susfs4ksu and apply patches
+      - name: Apply SUSFS patches
         working-directory: kernel
         run: |
           git clone --depth=1 -b "$SUSFS_BRANCH" https://gitlab.com/simonpunk/susfs4ksu.git ../susfs4ksu
           S=../susfs4ksu/kernel_patches
-          ls "$S"
-          # copy susfs kernel-side sources
+          # KSU driver dir (KSU-Next clones into KernelSU-Next/ or KernelSU/)
+          KSUDIR=KernelSU-Next; [ -d "$KSUDIR" ] || KSUDIR=KernelSU
+          echo "KSUDIR=$KSUDIR"
           cp -v "$S"/fs/* fs/ || true
           cp -v "$S"/include/linux/* include/linux/ || true
-          # copy patches
           cp -v "$S"/50_add_susfs_in_*.patch . || true
-          cp -v "$S"/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/ 2>/dev/null || echo "no 10_enable patch (SukiSU may bundle susfs)"
-          # apply KSU-side susfs enable patch (tolerate failure; SukiSU may already have it)
-          if [ -f KernelSU/10_enable_susfs_for_ksu.patch ]; then
-            ( cd KernelSU && patch -p1 --no-backup-if-mismatch < 10_enable_susfs_for_ksu.patch ) \
+          cp -v "$S"/KernelSU/10_enable_susfs_for_ksu.patch "$KSUDIR"/ 2>/dev/null || true
+          # KSU-side susfs enable patch
+          if [ -f "$KSUDIR/10_enable_susfs_for_ksu.patch" ]; then
+            ( cd "$KSUDIR" && patch -p1 --no-backup-if-mismatch < 10_enable_susfs_for_ksu.patch ) \
               > ../ksu_patch.log 2>&1 || echo "KSU susfs patch had rejects (see log)"
           fi
-          # apply kernel-side susfs patch
+          # kernel-side susfs patch
           patch -p1 --no-backup-if-mismatch < 50_add_susfs_in_*.patch > ../susfs_patch.log 2>&1 \
             || echo "kernel susfs patch had rejects (see log)"
-          echo "== .rej files:"; find . -name '*.rej' | tee ../rejects.txt
+          # manual fixup for the known sys.c uname-spoof hunk if it was rejected
+          if [ -f kernel/sys.c.rej ] && ! grep -q susfs_spoof_uname kernel/sys.c; then
+            echo "[fixup] patching kernel/sys.c newuname manually"
+            perl -0pi -e 's/(SYSCALL_DEFINE1\(newuname[^\n]*\n\{)/#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\nextern void susfs_spoof_uname(struct new_utsname* tmp);\n#endif\n$1/' kernel/sys.c
+            perl -0pi -e 's/(\tmemcpy\(&tmp, utsname\(\), sizeof\(tmp\)\);\n)/$1#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\n\tsusfs_spoof_uname(&tmp);\n#endif\n/' kernel/sys.c
+            grep -q susfs_spoof_uname kernel/sys.c && echo "sys.c fixup OK" || echo "FIXUP FAILED"
+            rm -f kernel/sys.c.rej
+          fi
+          echo "== remaining .rej:"; find . -name '*.rej' | tee ../rejects.txt
 
-      - name: Enable KSU + SUSFS in defconfig
+      - name: Configure (kprobe hook + SUSFS)
         working-directory: kernel
         run: |
-          DC=arch/arm64/configs/$DEFCONFIG
-          cat >> "$DC" <<'CFG'
-          CONFIG_KSU=y
-          CONFIG_KSU_SUSFS=y
-          CONFIG_KSU_SUSFS_SUS_PATH=y
-          CONFIG_KSU_SUSFS_SUS_MOUNT=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
-          CONFIG_KSU_SUSFS_SUS_KSTAT=y
-          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
-          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
-          CONFIG_KSU_SUSFS_ENABLE_LOG=y
-          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
-          CONFIG_KSU_SUSFS_SPOOF_BOOTCONFIG=y
-          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
-          CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
-          CFG
-          echo "== appended config tail:"; tail -20 "$DC"
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          args="O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=$GITHUB_WORKSPACE/gcc64/bin/aarch64-linux-android- CROSS_COMPILE_ARM32=$GITHUB_WORKSPACE/gcc32/bin/arm-linux-androideabi-"
+          make $args "$DEFCONFIG"
+          C=scripts/config
+          $C --file out/.config \
+            -e CONFIG_KSU \
+            -d CONFIG_KSU_MANUAL_HOOK \
+            -e CONFIG_KSU_KPROBES_HOOK \
+            -e CONFIG_KSU_SUSFS \
+            -e CONFIG_KSU_SUSFS_SUS_PATH \
+            -e CONFIG_KSU_SUSFS_SUS_MOUNT \
+            -e CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
+            -e CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
+            -e CONFIG_KSU_SUSFS_SUS_KSTAT \
+            -e CONFIG_KSU_SUSFS_TRY_UMOUNT \
+            -e CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
+            -e CONFIG_KSU_SUSFS_SPOOF_UNAME \
+            -e CONFIG_KSU_SUSFS_ENABLE_LOG \
+            -e CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+            -e CONFIG_KSU_SUSFS_SPOOF_BOOTCONFIG \
+            -e CONFIG_KSU_SUSFS_OPEN_REDIRECT
+          make $args olddefconfig
+          echo "== effective KSU/SUSFS/hook config:"
+          grep -E "CONFIG_KSU(_|=)|MANUAL_HOOK|KPROBES_HOOK" out/.config || true
 
       - name: Set up ccache
         uses: hendrikmuhs/ccache-action@v1.2
         with:
-          key: cezanne-susfs-${{ inputs.kernel_branch }}
+          key: cezanne-ksunext-${{ inputs.kernel_branch }}
           max-size: 2G
 
       - name: Build kernel
@@ -120,8 +137,6 @@ jobs:
                 CLANG_TRIPLE=aarch64-linux-gnu-
                 CROSS_COMPILE="$GITHUB_WORKSPACE/gcc64/bin/aarch64-linux-android-"
                 CROSS_COMPILE_ARM32="$GITHUB_WORKSPACE/gcc32/bin/arm-linux-androideabi-")
-          make -j"$(nproc)" "${args[@]}" "$DEFCONFIG"
-          echo "== effective susfs config:"; grep -E "CONFIG_KSU(_SUSFS)?" out/.config || true
           set -o pipefail
           make -j"$(nproc)" "${args[@]}" 2>&1 | tee build.log
           ls -la out/arch/arm64/boot/
@@ -141,5 +156,5 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cezanne-susfs-${{ github.run_number }}
+          name: cezanne-ksunext-${{ github.run_number }}
           path: artifact/
