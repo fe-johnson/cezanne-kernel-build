@@ -1,0 +1,98 @@
+name: Build cezanne kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: Kernel source repository (owner/name)
+        required: true
+        default: NCJFCQJ/android_kernel_xiaomi_mt6885
+      kernel_branch:
+        description: Kernel source branch
+        required: true
+        default: cgroup-v2
+      defconfig:
+        description: Defconfig
+        required: true
+        default: vendor/cezanne_user_defconfig
+      ksu_tag:
+        description: KernelSU tag (empty = build without KernelSU)
+        required: false
+        default: v0.7.6
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    env:
+      KERNEL_REPO: ${{ inputs.kernel_repo }}
+      KERNEL_BRANCH: ${{ inputs.kernel_branch }}
+      DEFCONFIG: ${{ inputs.defconfig }}
+      KSU_TAG: ${{ inputs.ksu_tag }}
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git ccache bc bison flex build-essential libssl-dev libelf-dev \
+            zip curl lz4 lzop cpio device-tree-compiler python2 python3 \
+            python-is-python3 zlib1g-dev
+
+      - name: Clone kernel source
+        run: git clone --depth=1 -b "$KERNEL_BRANCH" "https://github.com/$KERNEL_REPO" kernel
+
+      - name: Download AOSP clang r487747c and GCC 4.9
+        run: |
+          base=https://android.googlesource.com/platform/prebuilts
+          mkdir clang gcc64 gcc32
+          curl -fsSL "$base/clang/host/linux-x86/+archive/refs/heads/android14-release/clang-r487747c.tar.gz" | tar -xz -C clang
+          curl -fsSL "$base/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz" | tar -xz -C gcc64
+          curl -fsSL "$base/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz" | tar -xz -C gcc32
+          clang/bin/clang --version
+
+      - name: Integrate KernelSU
+        if: env.KSU_TAG != ''
+        working-directory: kernel
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/tiann/KernelSU/$KSU_TAG/kernel/setup.sh" | bash -s "$KSU_TAG"
+          git -C KernelSU log -1 --oneline
+
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: cezanne-${{ inputs.kernel_branch }}
+          max-size: 2G
+
+      - name: Build kernel
+        working-directory: kernel
+        run: |
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          export KBUILD_BUILD_USER=github KBUILD_BUILD_HOST=actions
+          args=(O=out ARCH=arm64 CC="ccache clang" LD=ld.lld
+                LLVM=1 LLVM_IAS=1 AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy
+                OBJDUMP=llvm-objdump STRIP=llvm-strip
+                CLANG_TRIPLE=aarch64-linux-gnu-
+                CROSS_COMPILE="$GITHUB_WORKSPACE/gcc64/bin/aarch64-linux-android-"
+                CROSS_COMPILE_ARM32="$GITHUB_WORKSPACE/gcc32/bin/arm-linux-androideabi-")
+          make -j"$(nproc)" "${args[@]}" "$DEFCONFIG"
+          make -j"$(nproc)" "${args[@]}" 2>&1 | tee build.log
+          ls -la out/arch/arm64/boot/
+
+      - name: Collect output
+        if: always()
+        working-directory: kernel
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/artifact"
+          cp -v out/arch/arm64/boot/Image* "$GITHUB_WORKSPACE/artifact/" 2>/dev/null || true
+          cp -v out/.config "$GITHUB_WORKSPACE/artifact/kernel.config" 2>/dev/null || true
+          tail -n 300 build.log > "$GITHUB_WORKSPACE/artifact/build-tail.log" 2>/dev/null || true
+          grep -E "CONFIG_(KSU|KPROBES|MODULES|LOCALVERSION)" out/.config || true
+          cat out/include/config/kernel.release 2>/dev/null || true
+
+      - name: Upload kernel image
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cezanne-kernel-${{ github.run_number }}
+          path: artifact/
