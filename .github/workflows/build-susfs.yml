@@ -91,6 +91,12 @@ jobs:
             rm -f KernelSU/kernel/selinux/selinux.c.rej
           fi
 
+          # this kernel uses atomic_long_t for cred->usage; fix KSU's injected get_cred_rcu
+          if grep -q "atomic_inc_not_zero(&nonconst_cred->usage)" KernelSU/kernel/Makefile; then
+            echo "[fixup] get_cred_rcu -> atomic_long_inc_not_zero"
+            sed -i 's/atomic_inc_not_zero(&nonconst_cred->usage)/atomic_long_inc_not_zero(\&nonconst_cred->usage)/g' KernelSU/kernel/Makefile
+          fi
+
           # --- kernel-side susfs patch (sys.c uname hunk fixed up manually) ---
           patch -p1 --no-backup-if-mismatch < 50_add_susfs_in_*.patch > ../susfs_patch.log 2>&1 \
             || echo "kernel patch had rejects (maybe sys.c)"
