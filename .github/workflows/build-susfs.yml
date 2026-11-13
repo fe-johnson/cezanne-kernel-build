@@ -1,4 +1,4 @@
-name: Build cezanne kernel (KernelSU-Next + SUSFS)
+name: Build cezanne kernel (official KSU v0.9.5 + SUSFS)
 
 on:
   workflow_dispatch:
@@ -15,10 +15,10 @@ on:
         description: Defconfig
         required: true
         default: vendor/cezanne_user_defconfig
-      ksunext_ref:
-        description: KernelSU-Next ref (branch/tag)
+      ksu_tag:
+        description: Official KernelSU tag
         required: true
-        default: next
+        default: v0.9.5
       susfs_branch:
         description: susfs4ksu branch
         required: true
@@ -31,11 +31,16 @@ jobs:
       KERNEL_REPO: ${{ inputs.kernel_repo }}
       KERNEL_BRANCH: ${{ inputs.kernel_branch }}
       DEFCONFIG: ${{ inputs.defconfig }}
-      KSUNEXT_REF: ${{ inputs.ksunext_ref }}
+      KSU_TAG: ${{ inputs.ksu_tag }}
       SUSFS_BRANCH: ${{ inputs.susfs_branch }}
       CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
       CCACHE_NOHASHDIR: "true"
     steps:
+      - name: Checkout this repo (for patches/)
+        uses: actions/checkout@v4
+        with:
+          path: self
+
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -55,54 +60,62 @@ jobs:
           curl -fsSL "$base/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz" | tar -xz -C gcc64
           curl -fsSL "$base/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz" | tar -xz -C gcc32
 
-      - name: Integrate KernelSU-Next
+      - name: Integrate official KernelSU
         working-directory: kernel
         run: |
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/$KSUNEXT_REF/kernel/setup.sh" | bash -s "$KSUNEXT_REF"
-          echo "== KSU-Next version:"; git -C KernelSU-Next log -1 --oneline 2>/dev/null || git -C KernelSU log -1 --oneline 2>/dev/null || true
-          ls drivers/kernelsu >/dev/null 2>&1 && echo "driver symlink OK"
+          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/$KSU_TAG/kernel/setup.sh" | bash -s "$KSU_TAG"
+          git -C KernelSU log -1 --oneline || true
 
       - name: Apply SUSFS patches
         working-directory: kernel
         run: |
           git clone --depth=1 -b "$SUSFS_BRANCH" https://gitlab.com/simonpunk/susfs4ksu.git ../susfs4ksu
           S=../susfs4ksu/kernel_patches
-          # KSU driver dir (KSU-Next clones into KernelSU-Next/ or KernelSU/)
-          KSUDIR=KernelSU-Next; [ -d "$KSUDIR" ] || KSUDIR=KernelSU
-          echo "KSUDIR=$KSUDIR"
           cp -v "$S"/fs/* fs/ || true
           cp -v "$S"/include/linux/* include/linux/ || true
           cp -v "$S"/50_add_susfs_in_*.patch . || true
-          cp -v "$S"/KernelSU/10_enable_susfs_for_ksu.patch "$KSUDIR"/ 2>/dev/null || true
-          # KSU-side susfs enable patch
-          if [ -f "$KSUDIR/10_enable_susfs_for_ksu.patch" ]; then
-            ( cd "$KSUDIR" && patch -p1 --no-backup-if-mismatch < 10_enable_susfs_for_ksu.patch ) \
-              > ../ksu_patch.log 2>&1 || echo "KSU susfs patch had rejects (see log)"
+          cp -v "$S"/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/ || true
+
+          # --- KSU-side susfs patch (1 selinux.c hunk is fixed up manually) ---
+          ( cd KernelSU && patch -p1 --no-backup-if-mismatch < 10_enable_susfs_for_ksu.patch ) \
+            > ../ksu_patch.log 2>&1 || echo "KSU patch had rejects (expected: selinux.c)"
+          if [ -f KernelSU/kernel/selinux/selinux.c.rej ]; then
+            echo "[fixup] inserting susfs selinux block before DEVPTS_DOMAIN"
+            if ! grep -q susfs_get_current_sid KernelSU/kernel/selinux/selinux.c; then
+              awk -v B="$GITHUB_WORKSPACE/self/patches/selinux_susfs_block.c" '
+                /^#define DEVPTS_DOMAIN/ && !done { while((getline l < B)>0) print l; print ""; done=1 }
+                {print}
+              ' KernelSU/kernel/selinux/selinux.c > /tmp/sx.c && mv /tmp/sx.c KernelSU/kernel/selinux/selinux.c
+            fi
+            grep -q susfs_get_current_sid KernelSU/kernel/selinux/selinux.c && echo "selinux fixup OK" || echo "selinux FIXUP FAILED"
+            rm -f KernelSU/kernel/selinux/selinux.c.rej
           fi
-          # kernel-side susfs patch
+
+          # --- kernel-side susfs patch (sys.c uname hunk fixed up manually) ---
           patch -p1 --no-backup-if-mismatch < 50_add_susfs_in_*.patch > ../susfs_patch.log 2>&1 \
-            || echo "kernel susfs patch had rejects (see log)"
-          # manual fixup for the known sys.c uname-spoof hunk if it was rejected
+            || echo "kernel patch had rejects (maybe sys.c)"
           if [ -f kernel/sys.c.rej ] && ! grep -q susfs_spoof_uname kernel/sys.c; then
             echo "[fixup] patching kernel/sys.c newuname manually"
             perl -0pi -e 's/(SYSCALL_DEFINE1\(newuname[^\n]*\n\{)/#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\nextern void susfs_spoof_uname(struct new_utsname* tmp);\n#endif\n$1/' kernel/sys.c
             perl -0pi -e 's/(\tmemcpy\(&tmp, utsname\(\), sizeof\(tmp\)\);\n)/$1#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\n\tsusfs_spoof_uname(&tmp);\n#endif\n/' kernel/sys.c
-            grep -q susfs_spoof_uname kernel/sys.c && echo "sys.c fixup OK" || echo "FIXUP FAILED"
+            grep -q susfs_spoof_uname kernel/sys.c && echo "sys.c fixup OK" || echo "sys.c FIXUP FAILED"
             rm -f kernel/sys.c.rej
           fi
+
           echo "== remaining .rej:"; find . -name '*.rej' | tee ../rejects.txt
 
-      - name: Configure (kprobe hook + SUSFS)
+      - name: Configure (SUSFS, kprobe hooks)
         working-directory: kernel
         run: |
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
-          args="O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=$GITHUB_WORKSPACE/gcc64/bin/aarch64-linux-android- CROSS_COMPILE_ARM32=$GITHUB_WORKSPACE/gcc32/bin/arm-linux-androideabi-"
-          make $args "$DEFCONFIG"
-          C=scripts/config
-          $C --file out/.config \
+          M=(O=out ARCH=arm64 CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1
+             AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
+             CLANG_TRIPLE=aarch64-linux-gnu-
+             CROSS_COMPILE="$GITHUB_WORKSPACE/gcc64/bin/aarch64-linux-android-"
+             CROSS_COMPILE_ARM32="$GITHUB_WORKSPACE/gcc32/bin/arm-linux-androideabi-")
+          make "${M[@]}" "$DEFCONFIG"
+          scripts/config --file out/.config \
             -e CONFIG_KSU \
-            -d CONFIG_KSU_MANUAL_HOOK \
-            -e CONFIG_KSU_KPROBES_HOOK \
             -e CONFIG_KSU_SUSFS \
             -e CONFIG_KSU_SUSFS_SUS_PATH \
             -e CONFIG_KSU_SUSFS_SUS_MOUNT \
@@ -116,14 +129,13 @@ jobs:
             -e CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
             -e CONFIG_KSU_SUSFS_SPOOF_BOOTCONFIG \
             -e CONFIG_KSU_SUSFS_OPEN_REDIRECT
-          make $args olddefconfig
-          echo "== effective KSU/SUSFS/hook config:"
-          grep -E "CONFIG_KSU(_|=)|MANUAL_HOOK|KPROBES_HOOK" out/.config || true
+          make "${M[@]}" olddefconfig
+          echo "== effective KSU/SUSFS config:"; grep -E "CONFIG_KSU" out/.config || true
 
       - name: Set up ccache
         uses: hendrikmuhs/ccache-action@v1.2
         with:
-          key: cezanne-ksunext-${{ inputs.kernel_branch }}
+          key: cezanne-ksu095-${{ inputs.kernel_branch }}
           max-size: 2G
 
       - name: Build kernel
@@ -131,14 +143,13 @@ jobs:
         run: |
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
           export KBUILD_BUILD_USER=github KBUILD_BUILD_HOST=actions
-          args=(O=out ARCH=arm64 CC="ccache clang" LD=ld.lld
-                LLVM=1 LLVM_IAS=1 AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy
-                OBJDUMP=llvm-objdump STRIP=llvm-strip
-                CLANG_TRIPLE=aarch64-linux-gnu-
-                CROSS_COMPILE="$GITHUB_WORKSPACE/gcc64/bin/aarch64-linux-android-"
-                CROSS_COMPILE_ARM32="$GITHUB_WORKSPACE/gcc32/bin/arm-linux-androideabi-")
+          M=(O=out ARCH=arm64 CC="ccache clang" LD=ld.lld LLVM=1 LLVM_IAS=1
+             AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
+             CLANG_TRIPLE=aarch64-linux-gnu-
+             CROSS_COMPILE="$GITHUB_WORKSPACE/gcc64/bin/aarch64-linux-android-"
+             CROSS_COMPILE_ARM32="$GITHUB_WORKSPACE/gcc32/bin/arm-linux-androideabi-")
           set -o pipefail
-          make -j"$(nproc)" "${args[@]}" 2>&1 | tee build.log
+          make -j"$(nproc)" "${M[@]}" 2>&1 | tee build.log
           ls -la out/arch/arm64/boot/
 
       - name: Collect output
@@ -156,5 +167,5 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cezanne-ksunext-${{ github.run_number }}
+          name: cezanne-ksu095-${{ github.run_number }}
           path: artifact/
