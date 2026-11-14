@@ -1,0 +1,193 @@
+name: Build MIUI 22.2.17 kernel (ReSukiSU + SUSFS)
+
+# Builds a drop-in boot.img for Redmi K30 Ultra (cezanne) on MIUI 13
+# developer build 22.2.17 (Android 11):
+#   - source:    MiCode/Xiaomi_Kernel_OpenSource @ cezanne-r-oss (4.14.186)
+#   - config:    IKCONFIG extracted from the stock 22.2.17 kernel
+#   - version:   uname -r pinned to the stock string so vendor .ko load
+#   - root:      ReSukiSU (SukiSU-Ultra fork that keeps non-GKI support)
+#   - hiding:    SUSFS v2.1.0 non-GKI backport + inline hooks
+# The stock boot.img is pulled from the official OTA zip with HTTP range
+# requests, and only its kernel is swapped (ramdisk, dtb, header untouched).
+
+on:
+  workflow_dispatch:
+    inputs:
+      localversion:
+        description: Kernel version suffix; must equal stock `uname -r` minus 4.14.186
+        required: true
+        default: -gdc97011ef0c6
+      ksu_ref:
+        description: ReSukiSU commit (pinned to match the SUSFS v2.1.0 backport)
+        required: true
+        default: 575ea1a164a8ee925c789fdd806e9dd383babeeb
+      relax_modversions:
+        description: Load vendor .ko even when a symbol CRC differs (warn instead of refuse)
+        type: boolean
+        default: true
+      rom_url:
+        description: Official OTA zip to take the stock boot.img from
+        required: true
+        default: https://bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com/22.2.17/miui_CEZANNE_22.2.17_106edbe449_11.0.zip
+  push:
+    branches: [feat/miui-sukisu-susfs]
+    paths:
+      - .github/workflows/build-miui-ksu-susfs.yml
+      - patches/miui/**
+      - configs/**
+      - tools/**
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    env:
+      # push runs have no inputs, so every value falls back to its default
+      LOCALVERSION: ${{ inputs.localversion || '-gdc97011ef0c6' }}
+      KSU_REF: ${{ inputs.ksu_ref || '575ea1a164a8ee925c789fdd806e9dd383babeeb' }}
+      RELAX_MODVERSIONS: ${{ github.event_name == 'push' && 'true' || inputs.relax_modversions }}
+      ROM_URL: ${{ inputs.rom_url || 'https://bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com/22.2.17/miui_CEZANNE_22.2.17_106edbe449_11.0.zip' }}
+      KERNEL_RELEASE_BASE: 4.14.186
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          path: self
+
+      - name: Clone kernel source (MiCode cezanne-r-oss)
+        run: |
+          git clone --depth=1 -b cezanne-r-oss https://github.com/MiCode/Xiaomi_Kernel_OpenSource.git kernel
+          git -C kernel log -1 --format='source commit: %H %ci'
+          # no .git => LOCALVERSION_AUTO / setlocalversion cannot append -g<sha>
+          rm -rf kernel/.git
+
+      - name: Apply patches (path_umount, SUSFS v2.1.0, KSU hooks)
+        working-directory: kernel
+        run: |
+          set -e
+          fail=0
+          for p in "$GITHUB_WORKSPACE"/self/patches/miui/*.patch; do
+            echo "::group::$(basename "$p")"
+            if ! patch -p1 --forward --no-backup-if-mismatch < "$p"; then fail=1; fi
+            echo "::endgroup::"
+          done
+          if [ "$fail" = 1 ] || [ -n "$(find . -name '*.rej' -print -quit)" ]; then
+            echo "::error::patch rejects"
+            find . -name '*.rej' -exec sh -c 'echo "=== $1"; cat "$1"' _ {} \;
+            exit 1
+          fi
+
+      - name: Relax module CRC check (optional)
+        if: env.RELAX_MODVERSIONS == 'true'
+        working-directory: kernel
+        run: |
+          set -e
+          # check_version(): on CRC mismatch keep the warning but accept the module,
+          # so vendor .ko built against the stock tree still load. vermagic must
+          # still match, which the pinned LOCALVERSION guarantees.
+          perl -0pi -e 's/(bad_version:\s*pr_warn\("%s: disagrees about version of symbol %s\\n",\s*info->name, symname\);\s*return )0;/${1}1;/' kernel/module.c
+          grep -n -A4 'bad_version:' kernel/module.c
+          grep -Pzoq 'bad_version:\s*pr_warn\([^;]*;\s*return 1;' kernel/module.c \
+            || { echo "::error::could not relax check_version"; exit 1; }
+
+      - name: Integrate ReSukiSU
+        working-directory: kernel
+        run: |
+          set -e
+          curl -fsSL "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/$KSU_REF/kernel/setup.sh" | bash -s "$KSU_REF"
+          git -C KernelSU log -1 --format='ReSukiSU: %H %ci %s'
+          ls -la drivers/kernelsu
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential cpio flex git kmod libelf-dev libssl-dev \
+            lz4 lzop python3 unzip xz-utils zip libtinfo5 libncurses5
+
+      - name: Download toolchain (clang-r383902 + GCC 4.9, same as stock)
+        run: |
+          set -e
+          base=https://android.googlesource.com/platform/prebuilts
+          mkdir -p tc/clang tc/gcc64 tc/gcc32
+          curl -fsSL --retry 5 "$base/clang/host/linux-x86/+archive/refs/tags/android-11.0.0_r48/clang-r383902.tar.gz" | tar -xz -C tc/clang
+          curl -fsSL --retry 5 "$base/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/android-11.0.0_r48.tar.gz" | tar -xz -C tc/gcc64
+          curl -fsSL --retry 5 "$base/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/refs/tags/android-11.0.0_r48.tar.gz" | tar -xz -C tc/gcc32
+          tc/clang/bin/clang --version | head -1
+
+      - name: Configure
+        working-directory: kernel
+        run: |
+          set -e
+          export PATH="$GITHUB_WORKSPACE/tc/clang/bin:$GITHUB_WORKSPACE/tc/gcc64/bin:$GITHUB_WORKSPACE/tc/gcc32/bin:$PATH"
+          M=(O=out ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu-
+             CROSS_COMPILE=aarch64-linux-android- CROSS_COMPILE_ARM32=arm-linux-androideabi-
+             LD=ld.lld NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump
+             READELF=llvm-readelf AR=llvm-ar STRIP=llvm-strip)
+          mkdir -p out
+          cp "$GITHUB_WORKSPACE/self/configs/cezanne-22.2.17-stock.config" out/.config
+          while IFS= read -r line; do
+            case "$line" in
+              CONFIG_*=y) scripts/config --file out/.config -e "${line%%=*}" ;;
+              "# CONFIG_"*" is not set") s=${line#\# }; scripts/config --file out/.config -d "${s%% *}" ;;
+            esac
+          done < "$GITHUB_WORKSPACE/self/configs/ksu-susfs.fragment"
+          scripts/config --file out/.config -d LOCALVERSION_AUTO --set-str LOCALVERSION "$LOCALVERSION"
+          make "${M[@]}" olddefconfig
+          echo "== KSU/SUSFS options:"; grep -E '^(# )?CONFIG_(KSU|KPM)' out/.config
+          missing=""
+          while IFS= read -r line; do
+            case "$line" in CONFIG_*=y) grep -qx "$line" out/.config || missing="$missing ${line%%=*}" ;; esac
+          done < "$GITHUB_WORKSPACE/self/configs/ksu-susfs.fragment"
+          [ -z "$missing" ] || { echo "::error::options not applied:$missing"; exit 1; }
+          make "${M[@]}" -s kernelrelease | tee ../kernelrelease.txt
+          [ "$(cat ../kernelrelease.txt)" = "$KERNEL_RELEASE_BASE$LOCALVERSION" ] \
+            || { echo "::error::kernelrelease does not match stock"; exit 1; }
+
+      - name: Build Image.gz
+        working-directory: kernel
+        run: |
+          set -eo pipefail
+          export PATH="$GITHUB_WORKSPACE/tc/clang/bin:$GITHUB_WORKSPACE/tc/gcc64/bin:$GITHUB_WORKSPACE/tc/gcc32/bin:$PATH"
+          export KBUILD_BUILD_USER=builder KBUILD_BUILD_HOST=m1-xm-ota-bd334.bj.idc.xiaomi.com
+          M=(O=out ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu-
+             CROSS_COMPILE=aarch64-linux-android- CROSS_COMPILE_ARM32=arm-linux-androideabi-
+             LD=ld.lld NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump
+             READELF=llvm-readelf AR=llvm-ar STRIP=llvm-strip)
+          make -j"$(nproc)" "${M[@]}" Image.gz 2>&1 | tee ../build.log | grep -E -- '^-- |error|warning: .*ksu|susfs' || true
+          test -f out/arch/arm64/boot/Image.gz
+          strings out/vmlinux | grep -m1 "Linux version"
+
+      - name: Repack stock boot.img with the new kernel
+        run: |
+          set -e
+          python3 -I self/tools/remotezip.py "$ROM_URL" get boot.img stock-boot.img
+          curl -fsSL -o magisk.apk https://github.com/topjohnwu/Magisk/releases/download/v28.1/Magisk-v28.1.apk
+          unzip -p magisk.apk lib/x86_64/libmagiskboot.so > magiskboot && chmod +x magiskboot
+          mkdir rp && cd rp
+          ../magiskboot unpack ../stock-boot.img
+          cp ../kernel/out/arch/arm64/boot/Image.gz kernel
+          ../magiskboot repack ../stock-boot.img ../boot-ksu-susfs.img
+          cd .. && ls -l stock-boot.img boot-ksu-susfs.img
+
+      - name: Collect artifacts
+        if: always()
+        run: |
+          mkdir -p dist
+          cp -v boot-ksu-susfs.img stock-boot.img dist/ 2>/dev/null || true
+          cp -v kernel/out/arch/arm64/boot/Image.gz dist/ 2>/dev/null || true
+          cp -v kernel/out/.config dist/kernel.config 2>/dev/null || true
+          cp -v kernelrelease.txt dist/ 2>/dev/null || true
+          tail -n 400 build.log > dist/build-tail.log 2>/dev/null || true
+          grep -E -- '^-- ' build.log > dist/ksu-build-info.log 2>/dev/null || true
+          (cd dist && sha256sum * > SHA256SUMS) || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cezanne-22.2.17-resukisu-susfs-${{ github.run_number }}
+          path: dist/
