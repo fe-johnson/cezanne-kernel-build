@@ -46,7 +46,8 @@ jobs:
     timeout-minutes: 240
     env:
       # push runs have no inputs, so every value falls back to its default
-      LOCALVERSION: ${{ inputs.localversion || '-gdc97011ef0c6' }}
+      # not named LOCALVERSION: kbuild appends that env var to the release string
+      STOCK_SUFFIX: ${{ inputs.localversion || '-gdc97011ef0c6' }}
       KSU_REF: ${{ inputs.ksu_ref || '575ea1a164a8ee925c789fdd806e9dd383babeeb' }}
       RELAX_MODVERSIONS: ${{ github.event_name == 'push' && 'true' || inputs.relax_modversions }}
       ROM_URL: ${{ inputs.rom_url || 'https://bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com/22.2.17/miui_CEZANNE_22.2.17_106edbe449_11.0.zip' }}
@@ -135,7 +136,7 @@ jobs:
               "# CONFIG_"*" is not set") s=${line#\# }; scripts/config --file out/.config -d "${s%% *}" ;;
             esac
           done < "$GITHUB_WORKSPACE/self/configs/ksu-susfs.fragment"
-          scripts/config --file out/.config -d LOCALVERSION_AUTO --set-str LOCALVERSION "$LOCALVERSION"
+          scripts/config --file out/.config -d LOCALVERSION_AUTO --set-str LOCALVERSION "$STOCK_SUFFIX"
           make "${M[@]}" olddefconfig
           echo "== KSU/SUSFS options:"; grep -E '^(# )?CONFIG_(KSU|KPM)' out/.config
           missing=""
@@ -144,7 +145,7 @@ jobs:
           done < "$GITHUB_WORKSPACE/self/configs/ksu-susfs.fragment"
           [ -z "$missing" ] || { echo "::error::options not applied:$missing"; exit 1; }
           make "${M[@]}" -s kernelrelease | tee ../kernelrelease.txt
-          [ "$(cat ../kernelrelease.txt)" = "$KERNEL_RELEASE_BASE$LOCALVERSION" ] \
+          [ "$(cat ../kernelrelease.txt)" = "$KERNEL_RELEASE_BASE$STOCK_SUFFIX" ] \
             || { echo "::error::kernelrelease does not match stock"; exit 1; }
 
       - name: Build Image.gz
