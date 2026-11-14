@@ -1,0 +1,11 @@
+diff --git a/drivers/media/platform/mtk-vcu/Makefile b/drivers/media/platform/mtk-vcu/Makefile
+--- a/drivers/media/platform/mtk-vcu/Makefile
++++ b/drivers/media/platform/mtk-vcu/Makefile
+@@ -4,6 +4,6 @@
+ mtk-vcu-y += mtk_vcu.o \
+ 	mtk_vcodec_mem.o \
+
+-obj-$(CONFIG_VIDEO_MEDIATEK_VCU) += mtk-vcu.o mtk_vcodec_mem.o
++obj-$(CONFIG_VIDEO_MEDIATEK_VCU) += mtk-vcu.o
+ ccflags-y += -I$(srctree)/arch/arm
+ ccflags-y += -I$(srctree)/drivers/misc/mediatek/include/mt-plat
