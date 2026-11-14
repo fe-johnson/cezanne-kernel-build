@@ -671,7 +671,6 @@ index b59e1054e96d..ef44e56e63a3 100644
 +}
 +#endif
 diff --git a/fs/notify/fdinfo.c b/fs/notify/fdinfo.c
-index c62a87ee3b00..396ed2a0bb75 100644
 --- a/fs/notify/fdinfo.c
 +++ b/fs/notify/fdinfo.c
 @@ -13,6 +13,9 @@
@@ -689,13 +688,13 @@ index c62a87ee3b00..396ed2a0bb75 100644
  #if defined(CONFIG_INOTIFY_USER) || defined(CONFIG_FANOTIFY)
  
 +#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-+static void show_fdinfo(struct seq_file *m, struct file *f,
-+			void (*show)(struct seq_file *m,
+ static void show_fdinfo(struct seq_file *m, struct file *f,
+ 			void (*show)(struct seq_file *m,
 +				     struct fsnotify_mark *mark,
 +				     struct file *file))
 +#else
- static void show_fdinfo(struct seq_file *m, struct file *f,
- 			void (*show)(struct seq_file *m,
++static void show_fdinfo(struct seq_file *m, struct file *f,
++			void (*show)(struct seq_file *m,
  				     struct fsnotify_mark *mark))
 +#endif
  {
@@ -712,7 +711,7 @@ index c62a87ee3b00..396ed2a0bb75 100644
  		if (seq_has_overflowed(m))
  			break;
  	}
-@@ -72,10 +86,17 @@ static void show_mark_fhandle(struct seq_file *m, struct inode *inode)
+@@ -72,10 +86,17 @@
  
  #ifdef CONFIG_INOTIFY_USER
  
@@ -730,10 +729,10 @@ index c62a87ee3b00..396ed2a0bb75 100644
  
  	if (!(mark->connector->flags & FSNOTIFY_OBJ_TYPE_INODE))
  		return;
-@@ -83,6 +104,39 @@ static void inotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark)
- 	inode_mark = container_of(mark, struct inotify_inode_mark, fsn_mark);
- 	inode = igrab(mark->connector->inode);
- 	if (inode) {
+@@ -90,6 +111,39 @@
+ 		 * used only internally to the kernel.
+ 		 */
+ 		u32 mask = mark->mask & IN_ALL_EVENTS;
 +#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
 +		mnt = real_mount(file->f_path.mnt);
 +		if (mnt->mnt_id >= DEFAULT_KSU_MNT_ID &&
@@ -744,16 +743,16 @@ index c62a87ee3b00..396ed2a0bb75 100644
 +			if (!pathname)
 +				goto orig_flow;
 +			dpath = d_path(&file->f_path, pathname, PAGE_SIZE);
-+			if (!dpath)
++			if (IS_ERR_OR_NULL(dpath))
 +				goto out_kfree;
 +			if (kern_path(dpath, 0, &path))
 +				goto out_kfree;
 +			if (!path.dentry->d_inode)
 +				goto out_path_put;
-+			seq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:0 ",
++			seq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:%x ",
 +				   inode_mark->wd, path.dentry->d_inode->i_ino,
 +				   path.dentry->d_inode->i_sb->s_dev,
-+				   inotify_mark_user_mask(mark));
++				   mask, mark->ignored_mask);
 +			show_mark_fhandle(m, path.dentry->d_inode);
 +			seq_putc(m, '\n');
 +			path_put(&path);
@@ -767,10 +766,10 @@ index c62a87ee3b00..396ed2a0bb75 100644
 +		}
 +orig_flow:
 +#endif
- 		seq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:0 ",
+ 		seq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:%x ",
  			   inode_mark->wd, inode->i_ino, inode->i_sb->s_dev,
- 			   inotify_mark_user_mask(mark));
-@@ -101,11 +155,19 @@ void inotify_show_fdinfo(struct seq_file *m, struct file *f)
+ 			   mask, mark->ignored_mask);
+@@ -108,11 +162,19 @@
  
  #ifdef CONFIG_FANOTIFY
  
@@ -852,7 +851,6 @@ index 6def25ed22d1..016a026f37af 100644
  			put_unused_fd(fd);
  			fd = PTR_ERR(f);
 diff --git a/fs/proc/base.c b/fs/proc/base.c
-index 62dd0b84d52c..13a79122fbbc 100644
 --- a/fs/proc/base.c
 +++ b/fs/proc/base.c
 @@ -94,6 +94,9 @@
@@ -865,7 +863,7 @@ index 62dd0b84d52c..13a79122fbbc 100644
  #ifdef CONFIG_HARDWALL
  #include <asm/hardwall.h>
  #endif
-@@ -901,6 +904,9 @@ static ssize_t mem_rw(struct file *file, char __user *buf,
+@@ -901,6 +904,9 @@
  	ssize_t copied;
  	char *page;
  	unsigned int flags;
@@ -875,27 +873,31 @@ index 62dd0b84d52c..13a79122fbbc 100644
  
  	if (!mm)
  		return 0;
-@@ -917,6 +923,19 @@ static ssize_t mem_rw(struct file *file, char __user *buf,
+@@ -917,6 +923,23 @@
  
  	while (count > 0) {
- 		size_t this_len = min_t(size_t, count, PAGE_SIZE);
+ 		int this_len = min_t(int, count, PAGE_SIZE);
 +#ifdef CONFIG_KSU_SUSFS_SUS_MAP
++		bool sus_map = false;
++
++		down_read(&mm->mmap_sem);
 +		vma = find_vma(mm, addr);
-+		if (vma && vma->vm_file) {
-+			struct inode *inode = file_inode(vma->vm_file);
-+			if (SUSFS_IS_INODE_SUS_MAP(inode)) {
-+				if (write)
-+					copied = -EFAULT;
-+				else
-+					copied = -EIO;
-+				break;
-+			}
++		if (vma && vma->vm_file &&
++		    SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))
++			sus_map = true;
++		up_read(&mm->mmap_sem);
++		if (sus_map) {
++			if (write)
++				copied = -EFAULT;
++			else
++				copied = -EIO;
++			break;
 +		}
 +#endif
  
  		if (write && copy_from_user(page, buf, this_len)) {
  			copied = -EFAULT;
-@@ -1715,6 +1734,10 @@ static const char *proc_pid_get_link(struct dentry *dentry,
+@@ -1716,6 +1739,10 @@
  	return ERR_PTR(error);
  }
  
@@ -906,7 +908,7 @@ index 62dd0b84d52c..13a79122fbbc 100644
  static int do_proc_readlink(struct path *path, char __user *buffer, int buflen)
  {
  	char *tmp = (char *)__get_free_page(GFP_KERNEL);
-@@ -1724,6 +1747,17 @@ static int do_proc_readlink(struct path *path, char __user *buffer, int buflen)
+@@ -1725,6 +1752,17 @@
  	if (!tmp)
  		return -ENOMEM;
  
@@ -924,7 +926,7 @@ index 62dd0b84d52c..13a79122fbbc 100644
  	pathname = d_path(path, tmp, PAGE_SIZE);
  	len = PTR_ERR(pathname);
  	if (IS_ERR(pathname))
-@@ -2235,6 +2269,9 @@ proc_map_files_readdir(struct file *file, struct dir_context *ctx)
+@@ -2236,6 +2274,9 @@
  	struct map_files_info info;
  	struct map_files_info *p;
  	int ret;
@@ -934,7 +936,7 @@ index 62dd0b84d52c..13a79122fbbc 100644
  
  	ret = -ENOENT;
  	task = get_proc_task(file_inode(file));
-@@ -2287,6 +2324,11 @@ proc_map_files_readdir(struct file *file, struct dir_context *ctx)
+@@ -2288,6 +2329,11 @@
  				vma = vma->vm_next) {
  			if (!vma->vm_file)
  				continue;
@@ -3572,29 +3574,29 @@ index 69b187523468..2f02f8ac06d7 100644
  }
  
 diff --git a/kernel/sys.c b/kernel/sys.c
-index 7f53b4afcd84..852d3e97f1e6 100644
 --- a/kernel/sys.c
 +++ b/kernel/sys.c
-@@ -1192,12 +1192,19 @@ static int override_release(char __user *release, size_t len)
+@@ -1184,6 +1184,10 @@
+ 	}
  	return ret;
  }
- 
++
 +#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
 +extern void susfs_spoof_uname(struct new_utsname *tmp);
 +#endif
-+
+ 
  SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)
  {
- 	struct new_utsname tmp;
+@@ -1191,6 +1195,9 @@
  
  	down_read(&uts_sem);
  	memcpy(&tmp, utsname(), sizeof(tmp));
 +#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
 +	susfs_spoof_uname(&tmp);
 +#endif
-         if (!strncmp(current->comm, "bpfloader", 9) ||
- 	    !strncmp(current->comm, "netbpfload", 10) ||
- 	    !strncmp(current->comm, "netd", 4)) {
+ 	up_read(&uts_sem);
+ 	if (copy_to_user(name, &tmp, sizeof(tmp)))
+ 		return -EFAULT;
 diff --git a/security/selinux/avc.c b/security/selinux/avc.c
 index f624bc4e612c..48f550121c84 100644
 --- a/security/selinux/avc.c
